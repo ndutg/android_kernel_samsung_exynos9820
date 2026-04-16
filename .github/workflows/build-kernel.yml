@@ -1,0 +1,230 @@
+name: Build Note10+ Exynos Kernel
+
+on:
+  workflow_dispatch:
+    inputs:
+      KERNEL_BRANCH:
+        description: "Kernel branch to build"
+        required: true
+        default: "lineage-23.2"
+
+      DEFCONFIG:
+        description: "Exact defconfig filename under arch/arm64/configs/"
+        required: true
+        default: ""
+
+      ENABLE_RESUKISU:
+        description: "Apply ReSukiSU/SukiSU setup script"
+        required: true
+        type: choice
+        options: ["true", "false"]
+        default: "false"
+
+      RESUKISU_SETUP_URL:
+        description: "Verified raw setup.sh URL for ReSukiSU/SukiSU integration"
+        required: false
+        default: ""
+
+      ENABLE_SUSFS:
+        description: "Apply SUSFS patches"
+        required: true
+        type: choice
+        options: ["true", "false"]
+        default: "false"
+
+      SUSFS_REPO:
+        description: "susfs repo"
+        required: true
+        default: "https://github.com/kutemeikito/susfs4ksu.git"
+
+      SUSFS_BRANCH:
+        description: "susfs branch/tag matching your kernel version, e.g. kernel-4.14"
+        required: false
+        default: ""
+
+      SUSFS_KERNEL_PATCH:
+        description: "susfs kernel patch file name, e.g. 50_add_susfs_in_kernel-4.14.patch"
+        required: false
+        default: ""
+
+      ENABLE_KPM:
+        description: "Gate KPM stage"
+        required: true
+        type: choice
+        options: ["true", "false"]
+        default: "false"
+
+      KPM_PATCH_REPO:
+        description: "KPM patch reference repo"
+        required: true
+        default: "https://github.com/SukiSU-Ultra/SukiSU_KernelPatch_patch.git"
+
+env:
+  ARCH: arm64
+  SUBARCH: arm64
+  OUT_DIR: out
+  TZ: UTC
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+
+    steps:
+      - name: Checkout kernel source
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.KERNEL_BRANCH }}
+          fetch-depth: 0
+          submodules: recursive
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            bc bison build-essential ccache curl flex gawk git jq \
+            gcc-aarch64-linux-gnu gcc-arm-linux-gnueabi \
+            libc6-dev libelf-dev libncurses-dev libssl-dev \
+            pahole rsync unzip xz-utils zip zstd \
+            clang lld llvm llvm-dev llvm-runtime \
+            python3 python3-pip
+
+      - name: Show tree basics
+        run: |
+          echo "Branch: ${{ inputs.KERNEL_BRANCH }}"
+          echo "Top level:"
+          ls -la
+          echo
+          echo "arm64 configs:"
+          ls -la arch/arm64/configs | head -n 200
+
+      - name: Validate defconfig
+        run: |
+          test -n "${{ inputs.DEFCONFIG }}" || { echo "DEFCONFIG is required"; exit 1; }
+          test -f "arch/arm64/configs/${{ inputs.DEFCONFIG }}" || {
+            echo "Defconfig not found: arch/arm64/configs/${{ inputs.DEFCONFIG }}"
+            exit 1
+          }
+
+      - name: Apply ReSukiSU setup
+        if: ${{ inputs.ENABLE_RESUKISU == 'true' }}
+        run: |
+          test -n "${{ inputs.RESUKISU_SETUP_URL }}" || {
+            echo "ENABLE_RESUKISU=true but RESUKISU_SETUP_URL is empty"
+            exit 1
+          }
+          curl -L --fail "${{ inputs.RESUKISU_SETUP_URL }}" -o /tmp/root_setup.sh
+          chmod +x /tmp/root_setup.sh
+          bash /tmp/root_setup.sh
+
+      - name: Verify KernelSU tree exists after root setup
+        if: ${{ inputs.ENABLE_RESUKISU == 'true' }}
+        run: |
+          test -d KernelSU || {
+            echo "KernelSU directory not found after setup. Check your setup URL/script."
+            exit 1
+          }
+
+      - name: Apply SUSFS
+        if: ${{ inputs.ENABLE_SUSFS == 'true' }}
+        run: |
+          test -n "${{ inputs.SUSFS_BRANCH }}" || {
+            echo "SUSFS_BRANCH is required when ENABLE_SUSFS=true"
+            exit 1
+          }
+          test -n "${{ inputs.SUSFS_KERNEL_PATCH }}" || {
+            echo "SUSFS_KERNEL_PATCH is required when ENABLE_SUSFS=true"
+            exit 1
+          }
+          test -d KernelSU || {
+            echo "KernelSU directory not found. Enable ReSukiSU/KernelSU setup first."
+            exit 1
+          }
+
+          git clone --depth=1 --branch "${{ inputs.SUSFS_BRANCH }}" "${{ inputs.SUSFS_REPO }}" susfs4ksu
+
+          cp susfs4ksu/kernel_patches/KernelSU/10_enable_susfs_for_ksu.patch KernelSU/
+          cp "susfs4ksu/kernel_patches/${{ inputs.SUSFS_KERNEL_PATCH }}" ./
+          cp -r susfs4ksu/kernel_patches/fs/* fs/
+          cp -r susfs4ksu/kernel_patches/include/linux/* include/linux/
+
+          pushd KernelSU
+          patch -p1 < 10_enable_susfs_for_ksu.patch
+          popd
+
+          patch -p1 < "${{ inputs.SUSFS_KERNEL_PATCH }}"
+
+          # Best-effort non-kprobe disable in KernelSU tree for non-GKI SUSFS flows.
+          find KernelSU -type f -print0 | xargs -0 sed -i 's/^#ifdef CONFIG_KPROBES$/#if defined(CONFIG_KPROBES) \&\& 0/g' || true
+
+      - name: Enable config flags in defconfig
+        run: |
+          CFG="arch/arm64/configs/${{ inputs.DEFCONFIG }}"
+
+          ensure_cfg() {
+            KEY="$1"
+            VAL="$2"
+            sed -i "/^${KEY}=.*/d" "$CFG"
+            sed -i "/^# ${KEY} is not set/d" "$CFG"
+            echo "${KEY}=${VAL}" >> "$CFG"
+          }
+
+          if [ "${{ inputs.ENABLE_RESUKISU }}" = "true" ]; then
+            ensure_cfg CONFIG_KSU y
+          fi
+
+          if [ "${{ inputs.ENABLE_SUSFS }}" = "true" ]; then
+            ensure_cfg CONFIG_KSU y
+            ensure_cfg CONFIG_KSU_SUSFS y
+            ensure_cfg CONFIG_KSU_SUSFS_HAS_MAGIC_MOUNT y
+          fi
+
+      - name: Prepare output dir
+        run: mkdir -p "${OUT_DIR}"
+
+      - name: Build kernel
+        run: |
+          export PATH="/usr/lib/llvm-14/bin:/usr/lib/llvm-15/bin:/usr/lib/llvm-16/bin:$PATH"
+          export CC=clang
+          export LD=ld.lld
+          export LLVM=1
+          export LLVM_IAS=1
+          export CROSS_COMPILE=aarch64-linux-gnu-
+          export CROSS_COMPILE_COMPAT=arm-linux-gnueabi-
+
+          make O="${OUT_DIR}" ARCH="${ARCH}" "${{ inputs.DEFCONFIG }}"
+          make -j"$(nproc --all)" \
+            O="${OUT_DIR}" \
+            ARCH="${ARCH}" \
+            CC="${CC}" \
+            LD="${LD}" \
+            LLVM="${LLVM}" \
+            LLVM_IAS="${LLVM_IAS}" \
+            CROSS_COMPILE="${CROSS_COMPILE}" \
+            CROSS_COMPILE_COMPAT="${CROSS_COMPILE_COMPAT}"
+
+      - name: Collect artifacts
+        run: |
+          mkdir -p artifacts
+          find "${OUT_DIR}" -type f \( \
+            -name "Image" -o \
+            -name "Image.gz" -o \
+            -name "Image.gz-dtb" -o \
+            -name "*.dtb" -o \
+            -name "dtbo.img" -o \
+            -name "*.ko" \
+          \) -exec cp --parents {} artifacts/ \;
+          cp "arch/arm64/configs/${{ inputs.DEFCONFIG }}" artifacts/defconfig.used || true
+
+      - name: Fetch KPM reference repo
+        if: ${{ inputs.ENABLE_KPM == 'true' }}
+        run: |
+          git clone --depth=1 "${{ inputs.KPM_PATCH_REPO }}" kpm_ref
+          echo "KPM reference repo cloned to kpm_ref/"
+          echo "No automatic patch apply is done in this first-pass workflow."
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: note10plus-exynos-kernel-${{ github.run_number }}
+          path: artifacts/
+          if-no-files-found: warn
