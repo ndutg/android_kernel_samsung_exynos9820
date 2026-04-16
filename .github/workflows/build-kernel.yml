@@ -2,53 +2,35 @@ name: Build Note10+ KernelSU Next + SUSFS
 
 on:
   workflow_dispatch:
-    inputs:
-      KERNEL_BRANCH:
-        description: "Kernel source branch"
-        required: true
-        default: "lineage-23.2"
-      DEFCONFIG:
-        description: "Defconfig"
-        required: true
-        default: "exynos9820-d2sdefconfig"
-      KSU_NEXT_REF:
-        description: "KernelSU Next ref"
-        required: true
-        default: "main"
-      SUSFS_REPO:
-        description: "SUSFS repo URL"
-        required: true
-        default: "https://github.com/Star-Seven/susfs4ksu.git"
-      SUSFS_REF:
-        description: "SUSFS branch or tag"
-        required: true
-        default: "main"
-
-env:
-  ARCH: arm64
-  SUBARCH: arm64
-  OUTDIR: out
-  TZ: UTC
 
 jobs:
   build:
     runs-on: ubuntu-22.04
+    timeout-minutes: 180
+
     env:
-      KERNEL_BRANCH: ${{ inputs.KERNEL_BRANCH }}
-      DEFCONFIG: ${{ inputs.DEFCONFIG }}
-      KSU_NEXT_REF: ${{ inputs.KSU_NEXT_REF }}
-      SUSFS_REPO: ${{ inputs.SUSFS_REPO }}
-      SUSFS_REF: ${{ inputs.SUSFS_REF }}
+      ARCH: arm64
+      SUBARCH: arm64
+      OUTDIR: out
+      TZ: UTC
+      KERNEL_REPO: ndutg/android_kernel_samsung_exynos9820
+      KERNELBRANCH: lineage-23.2
+      DEFCONFIG: exynos9820-d2sdefconfig
+      KSUNEXT_REPO: rifsxd/KernelSU-Next
+      KSUNEXTREF: main
+      SUSFSREPO: https://github.com/Star-Seven/susfs4ksu.git
+      SUSFSREF: main
 
     steps:
       - name: Checkout kernel source
         uses: actions/checkout@v4
         with:
-          ref: ${{ inputs.KERNEL_BRANCH }}
+          repository: ${{ env.KERNEL_REPO }}
+          ref: ${{ env.KERNELBRANCH }}
           fetch-depth: 0
           submodules: recursive
 
-      - name: Install dependencies
+      - name: Install build dependencies
         run: |
           sudo apt-get update
           sudo apt-get install -y \
@@ -61,6 +43,7 @@ jobs:
 
       - name: Show source info
         run: |
+          set -euxo pipefail
           echo "Repo: $GITHUB_REPOSITORY"
           echo "Branch: $(git rev-parse --abbrev-ref HEAD)"
           echo "Commit: $(git rev-parse --short HEAD)"
@@ -68,88 +51,68 @@ jobs:
           echo "Detected exynos9820 configs:"
           ls -1 arch/arm64/configs | grep exynos9820 || true
           echo
-          test -f "arch/arm64/configs/${DEFCONFIG}"
+          echo "Using fixed defconfig: ${DEFCONFIG}"
+          ls -l "arch/arm64/configs/${DEFCONFIG}"
+
+      - name: Prepare artifacts dir
+        run: mkdir -p artifacts
 
       - name: Integrate KernelSU Next
         run: |
-          set -euo pipefail
-          curl -LSs "https://raw.githubusercontent.com/KernelSU-Next/KernelSU-Next/${KSU_NEXT_REF}/kernel/setup.sh" | bash -s "${KSU_NEXT_REF}"
-          test -d KernelSU
+          set -euxo pipefail
+          git clone --depth=1 -b "${KSUNEXTREF}" "https://github.com/${KSUNEXT_REPO}.git" kernelsu-next
+
+          if [ -f kernelsu-next/kernel/setup.sh ]; then
+            bash kernelsu-next/kernel/setup.sh
+          elif [ -f kernelsu-next/kernel/setup-kernel.sh ]; then
+            bash kernelsu-next/kernel/setup-kernel.sh
+          else
+            echo "::error::KernelSU Next setup script not found"
+            find kernelsu-next -maxdepth 3 -type f | sort | tee artifacts/ksunext-files.txt
+            exit 1
+          fi
+
+          find KernelSU -maxdepth 3 -type f 2>/dev/null | sort | tee artifacts/kernelsu-tree.txt || true
 
       - name: Clone SUSFS
         run: |
-          set -euo pipefail
-          git clone --depth=1 --branch "${SUSFS_REF}" "${SUSFS_REPO}" "${RUNNER_TEMP}/susfs4ksu"
-          test -d "${RUNNER_TEMP}/susfs4ksu/kernel_patches"
+          set -euxo pipefail
+          git clone --depth=1 -b "${SUSFSREF}" "${SUSFSREPO}" susfs4ksu
+          find susfs4ksu -maxdepth 3 -type f | sort | tee artifacts/susfs-files.txt
 
       - name: Apply SUSFS patches
         run: |
-          set -euo pipefail
+          set -euxo pipefail
 
-          KERNEL_VER="$(awk '
-            /^VERSION =/    {v=$3}
-            /^PATCHLEVEL =/ {p=$3}
-            END {print v "." p}
-          ' Makefile)"
+          PATCH_CANDIDATES="$(find susfs4ksu -type f \( -name '*.patch' -o -name '*.diff' \) | sort || true)"
+          printf '%s\n' "${PATCH_CANDIDATES}" | tee artifacts/susfs-patch-list.txt
 
-          echo "Detected kernel version: ${KERNEL_VER}"
-
-          SUSFS_PATCH="$(find "${RUNNER_TEMP}/susfs4ksu/kernel_patches" \
-            -maxdepth 1 -type f \
-            -name "50_add_susfs_in_kernel-${KERNEL_VER}*.patch" | head -n1 || true)"
-
-          if [ -z "${SUSFS_PATCH}" ]; then
-            echo "::error::No SUSFS kernel patch found for kernel version ${KERNEL_VER}"
-            echo "Available patches:"
-            find "${RUNNER_TEMP}/susfs4ksu/kernel_patches" -maxdepth 1 -type f -name '50_add_susfs_in_kernel-*' -printf '%f\n' || true
+          if [ -z "${PATCH_CANDIDATES}" ]; then
+            echo "::error::No SUSFS patch files found"
             exit 1
           fi
 
-          echo "Using SUSFS patch: $(basename "${SUSFS_PATCH}")"
+          APPLIED=0
+          while IFS= read -r patchfile; do
+            [ -n "${patchfile}" ] || continue
+            echo "Trying patch: ${patchfile}" | tee -a artifacts/susfs-apply.log
+            if patch -p1 --forward --dry-run < "${patchfile}" >> artifacts/susfs-apply.log 2>&1; then
+              patch -p1 --forward < "${patchfile}" >> artifacts/susfs-apply.log 2>&1
+              echo "Applied: ${patchfile}" | tee -a artifacts/susfs-apply.log
+              APPLIED=1
+              break
+            fi
+          done <<< "${PATCH_CANDIDATES}"
 
-          cp -f "${RUNNER_TEMP}/susfs4ksu/kernel_patches/KernelSU/10_enable_susfs_for_ksu.patch" KernelSU/
-          cp -f "${SUSFS_PATCH}" ./50_add_susfs_in_kernel.patch
-
-          if [ -d "${RUNNER_TEMP}/susfs4ksu/kernel_patches/fs" ]; then
-            cp -rf "${RUNNER_TEMP}/susfs4ksu/kernel_patches/fs/." fs/
-          fi
-
-          if [ -d "${RUNNER_TEMP}/susfs4ksu/kernel_patches/include/linux" ]; then
-            cp -rf "${RUNNER_TEMP}/susfs4ksu/kernel_patches/include/linux/." include/linux/
-          fi
-
-          (
-            cd KernelSU
-            patch -p1 --forward < 10_enable_susfs_for_ksu.patch || true
-          )
-
-          patch -p1 --forward < 50_add_susfs_in_kernel.patch || true
-
-          REJECTS="$(find . -type f \( -name '*.rej' -o -name '*.orig' \) | wc -l | tr -d ' ')"
-          if [ "${REJECTS}" != "0" ]; then
-            echo "::error::Patch rejects found"
-            find . -type f \( -name '*.rej' -o -name '*.orig' \) -print
+          if [ "${APPLIED}" -ne 1 ]; then
+            echo "::error::No SUSFS patch could be applied cleanly"
+            find . -type f \( -name '*.rej' -o -name '*.orig' \) | tee artifacts/reject-files.txt || true
             exit 1
           fi
 
-      - name: Enable KernelSU Next + SUSFS config
+      - name: Configure kernel
         run: |
-          set -euo pipefail
-          CFG="arch/arm64/configs/${DEFCONFIG}"
-
-          sed -i '/^# CONFIG_KSU is not set$/d' "${CFG}" || true
-          sed -i '/^# CONFIG_KSU_SUSFS is not set$/d' "${CFG}" || true
-          sed -i '/^# CONFIG_KSU_SUSFS_HAS_MAGIC_MOUNT is not set$/d' "${CFG}" || true
-
-          grep -qxF 'CONFIG_KSU=y' "${CFG}" || echo 'CONFIG_KSU=y' >> "${CFG}"
-          grep -qxF 'CONFIG_KSU_SUSFS=y' "${CFG}" || echo 'CONFIG_KSU_SUSFS=y' >> "${CFG}"
-          grep -qxF 'CONFIG_KSU_SUSFS_HAS_MAGIC_MOUNT=y' "${CFG}" || echo 'CONFIG_KSU_SUSFS_HAS_MAGIC_MOUNT=y' >> "${CFG}"
-
-          tail -n 20 "${CFG}"
-
-      - name: Build kernel
-        run: |
-          set -euo pipefail
+          set -euxo pipefail
           mkdir -p "${OUTDIR}"
 
           export PATH="/usr/lib/llvm-14/bin:/usr/lib/llvm-15/bin:/usr/lib/llvm-16/bin:${PATH}"
@@ -161,6 +124,20 @@ jobs:
           export CROSS_COMPILE_COMPAT=arm-linux-gnueabi-
 
           make O="${OUTDIR}" ARCH="${ARCH}" "${DEFCONFIG}"
+
+          cp -f "${OUTDIR}/.config" artifacts/kernel.config
+
+      - name: Build kernel
+        run: |
+          set -euxo pipefail
+
+          export PATH="/usr/lib/llvm-14/bin:/usr/lib/llvm-15/bin:/usr/lib/llvm-16/bin:${PATH}"
+          export CC=clang
+          export LD=ld.lld
+          export LLVM=1
+          export LLVM_IAS=1
+          export CROSS_COMPILE=aarch64-linux-gnu-
+          export CROSS_COMPILE_COMPAT=arm-linux-gnueabi-
 
           set +e
           make -j"$(nproc --all)" \
@@ -176,27 +153,32 @@ jobs:
           BUILD_RC=${PIPESTATUS[0]}
           set -e
 
+          cp -f build.log artifacts/ || true
           exit "${BUILD_RC}"
 
-      - name: Collect artifacts
+      - name: Collect outputs
         if: always()
         run: |
+          set +e
           mkdir -p artifacts
 
           cp -f build.log artifacts/ 2>/dev/null || true
           cp -f "${OUTDIR}/.config" artifacts/ 2>/dev/null || true
           cp -f "${OUTDIR}/vmlinux" artifacts/ 2>/dev/null || true
+          cp -f System.map artifacts/ 2>/dev/null || true
+          cp -f "${OUTDIR}/System.map" artifacts/ 2>/dev/null || true
 
           find "${OUTDIR}/arch/arm64/boot" -maxdepth 2 -type f \
-            \( -name "Image" -o -name "Image.gz" -o -name "Image.gz-dtb" -o -name "*.dtb" -o -name "*.dtbo" \) \
-            -exec cp -vf {} artifacts/ \; || true
+            \( -name 'Image' -o -name 'Image.gz' -o -name 'Image.gz-dtb' -o -name '*.dtb' -o -name '*.dtbo' \) \
+            -exec cp -vf {} artifacts/ \; 2>/dev/null || true
 
-          find . -type f \( -name '*.rej' -o -name '*.orig' \) -exec cp -vf {} artifacts/ \; || true
+          find . -type f \( -name '*.rej' -o -name '*.orig' \) \
+            -exec cp -vf {} artifacts/ \; 2>/dev/null || true
 
       - name: Upload artifacts
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: note10plus-ksunext-susfs-${{ github.run_number }}
-          path: artifacts/
+          name: note10plus-ksunext-susfs
+          path: artifacts
           if-no-files-found: warn
